@@ -34,4 +34,6 @@ public class SwitchNumber {
     }
     System.out.println("Size: " + size);
   }
+
+  
 }
