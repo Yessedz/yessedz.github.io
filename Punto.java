@@ -9,7 +9,7 @@ public class Punto{
         return X;
     }
 
-    private int Y;
+    private int Y;                                        //podras modificar tus codigos desde aqui y guardarlos
     public void setY(int Y){
         this.Y= Y;
     }
