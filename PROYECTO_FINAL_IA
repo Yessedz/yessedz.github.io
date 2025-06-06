@@ -1,0 +1,530 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import pygame
+from pygame import mixer
+from typing import Optional, Tuple, List, Dict
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Embedding, Dropout
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from collections import defaultdict, Counter
+import time
+import random
+
+class WordPredictor:
+    def __init__(self):
+        
+        self.words = [
+            "hola", "hoy", "hora", "hotel", "hombre", "hacer", "hablar", "hecho",
+            "casa", "comer", "correr", "calle", "cielo", "coche", "cuerpo", "cabeza",
+            "día", "decir", "donde", "dulce", "dolor", "dinero", "deseo", "dormir",
+            "quiero", "tengo", "tiempo", "tarde", "temprano", "trabajo", "tierra",
+            "mundo", "madre", "mano", "mujer", "mesa", "música", "mañana", "miedo",
+            "gracias", "gente", "grande", "gusto", "guitarra", "gato", "gris", "gozo",
+            "bien", "bueno", "bello", "boca", "brazo", "blanco", "bajo", "barco",
+            "feliz", "fiesta", "flor", "frío", "fuerte", "fácil", "familia", "fuego",
+            "amor", "agua", "aire", "amigo", "alto", "azul", "animal", "árbol",
+            "verde", "vida", "voz", "verdad", "viaje", "viento", "vino", "vista",
+            "sí", "sol", "sal", "sueño", "silla", "sangre", "sano", "sabor"
+        ]
+        
+        self.word_to_index = {word: i for i, word in enumerate(self.words)}
+        self.index_to_word = {i: word for i, word in enumerate(self.words)}
+        
+       
+        self._prepare_char_level_data()
+        
+        # Construir y entrenar el modelo
+        self.model = self._build_char_level_model()
+        self._train_char_level_model()
+        
+        # Crear n-gramas para sugerencias rápidas
+        self._create_ngrams()
+    
+    def _prepare_char_level_data(self):
+        """Prepara los datos a nivel de caracteres para el modelo LSTM"""
+        # Crear secuencias de caracteres
+        self.char_to_idx = {char: i for i, char in enumerate(sorted(set(''.join(self.words))))}
+        self.idx_to_char = {i: char for char, i in self.char_to_idx.items()}
+        
+        self.max_word_len = max(len(word) for word in self.words)
+        
+        # Preparar X e y
+        self.X = []
+        self.y = []
+        
+        for word in self.words:
+            for i in range(1, len(word)):
+                # Convertir los caracteres anteriores a índices
+                context = [self.char_to_idx[char] for char in word[:i]]
+                next_char = self.char_to_idx[word[i]]
+                
+                self.X.append(context)
+                self.y.append(next_char)
+       
+        if len(self.X) > 0:
+            self.X = pad_sequences(self.X, maxlen=self.max_word_len-1, padding='post')
+            self.y = tf.keras.utils.to_categorical(self.y, num_classes=len(self.char_to_idx))
+    
+    def _build_char_level_model(self):
+        """Construye el modelo LSTM a nivel de caracteres"""
+        if not hasattr(self, 'char_to_idx') or not self.char_to_idx:
+            return None
+            
+        model = Sequential([
+            Embedding(input_dim=len(self.char_to_idx), 
+                     output_dim=16, 
+                     input_length=self.max_word_len-1),
+            LSTM(32, return_sequences=False),
+            Dropout(0.2),
+            Dense(len(self.char_to_idx), activation='softmax')
+        ])
+        
+        model.compile(optimizer='adam',
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy'])
+        return model
+    
+    def _train_char_level_model(self, epochs=30):
+        """Entrena el modelo a nivel de caracteres"""
+        if len(self.X) > 0 and len(self.y) > 0 and self.model is not None:
+            self.model.fit(self.X, self.y, epochs=epochs, verbose=0)
+    
+    def _create_ngrams(self):
+        """Crea n-gramas para sugerencias rápidas"""
+        self.ngrams = defaultdict(Counter)
+        
+        for word in self.words:
+            for i in range(1, len(word)):
+                prefix = word[:i]
+                if i < len(word):
+                    next_char = word[i]
+                    self.ngrams[prefix][next_char] += 1
+    
+    def _predict_next_chars(self, prefix: str, n: int = 3) -> List[str]:
+        """Predice los siguientes caracteres usando el modelo LSTM"""
+        if not prefix or not self.model:
+            return []
+            
+        # Convertir el prefijo a índices
+        seq = [self.char_to_idx.get(char, -1) for char in prefix]
+        seq = [x for x in seq if x != -1]
+        
+        if not seq:
+            return []
+            
+        # Aplicar padding
+        seq = pad_sequences([seq], maxlen=self.max_word_len-1, padding='post')
+        
+        # Hacer predicción
+        preds = self.model.predict(seq, verbose=0)[0]
+        top_indices = preds.argsort()[-n:][::-1]
+        
+        return [self.idx_to_char.get(idx, '') for idx in top_indices if idx in self.idx_to_char]
+    
+    def predict_completions(self, prefix: str, n: int = 3) -> List[str]:
+        """Genera sugerencias de autocompletado combinando diferentes enfoques"""
+        prefix = prefix.lower()
+        suggestions = set()
+        
+        # 1. Primero buscar palabras que empiecen con el prefijo
+        exact_matches = [word for word in self.words if word.startswith(prefix)]
+        suggestions.update(exact_matches[:n])
+        
+        # Si ya tenemos suficientes sugerencias, devolverlas
+        if len(suggestions) >= n:
+            return sorted(suggestions)[:n]
+        
+        # 2. Usar el modelo LSTM para generar posibles terminaciones
+        if prefix and self.model:
+            next_chars = self._predict_next_chars(prefix, n)
+            for char in next_chars:
+                candidate = prefix + char
+                # Buscar palabras que empiecen con el candidato
+                for word in self.words:
+                    if word.startswith(candidate):
+                        suggestions.add(word)
+                        if len(suggestions) >= n*2:  # Recolectar más para filtrar después
+                            break
+        
+        # 3. Usar n-gramas para sugerencias adicionales
+        if prefix in self.ngrams:
+            for next_char, count in self.ngrams[prefix].most_common(n):
+                candidate = prefix + next_char
+                for word in self.words:
+                    if word.startswith(candidate):
+                        suggestions.add(word)
+                        break
+        
+        # Filtrar y ordenar las sugerencias
+        filtered = []
+        for word in suggestions:
+            if word.startswith(prefix):
+                filtered.append(word)
+        
+        # Ordenar por longitud primero, luego alfabéticamente
+        filtered.sort(key=lambda x: (len(x), x))
+        
+        return filtered[:n]
+
+class VirtualKeyboard:
+    def __init__(self):
+        # Inicialización de componentes
+        self._init_pygame()
+        self._init_hand_detection()
+        self._init_camera()
+        
+        # Configuración del teclado
+        self.keyboard = [
+            ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
+            ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'Ñ'],
+            ['Z', 'X', 'C', 'V', 'B', 'N', 'M', ',', '.', '¿'],
+            ['MAYUS', 'ESPACIO', 'BORRAR', 'ENTER']
+        ]
+        
+        # Configuración de tamaños y espacios
+        self.key_size = 80
+        self.key_margin = 15
+        
+        # Configuración especial para la fila inferior
+        self.special_key_widths = {
+            'MAYUS': 180,
+            'ESPACIO': 280,
+            'BORRAR': 180,
+            'ENTER': 180
+        }
+        self.special_key_margin = 25
+        
+        self.start_x = 100
+        self.start_y = 150
+        
+        # Estado de la aplicación
+        self.selected_key = None
+        self.typed_text = ""
+        self.caps_lock = False
+        self.cursor_counter = 0
+        self.click_cooldown = 0
+        self.last_typed_time = 0
+        self.suggestions = []
+        self.last_word_prefix = ""
+        
+        # Inicializar el predictor de palabras
+        self.word_predictor = WordPredictor()
+
+    def _init_pygame(self):
+        """Inicializa pygame y los sonidos"""
+        pygame.init()
+        mixer.init()
+        try:
+            self.key_sound = mixer.Sound("key_press.wav")
+        except:
+            # Crear un sonido simple si no se encuentra el archivo
+            sample_rate = 44100
+            duration = 0.1
+            t = np.linspace(0, duration, int(sample_rate * duration), False)
+            tone = np.sin(2 * np.pi * 880 * t) * 0.3
+            tone = np.c_[tone, tone]
+            self.key_sound = pygame.sndarray.make_sound((tone * 32767).astype(np.int16))
+            self.key_sound.set_volume(0.2)
+
+    def _init_hand_detection(self):
+        """Configura el detector de manos"""
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            max_num_hands=1,
+            min_detection_confidence=0.8,
+            min_tracking_confidence=0.8
+        )
+        self.mp_drawing = mp.solutions.drawing_utils
+
+    def _init_camera(self):
+        """Inicializa la cámara"""
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            raise RuntimeError("No se pudo abrir la cámara")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    def draw_keyboard(self, img: np.ndarray) -> None:
+        """Dibuja el teclado en la imagen con sugerencias de autocompletado"""
+        # Dibujar sugerencias de autocompletado
+        if self.suggestions and time.time() - self.last_typed_time < 3:
+            for i, suggestion in enumerate(self.suggestions[:3]):
+                x = self.start_x + i * 150
+                y = self.start_y - 120
+                
+                # Resaltar la sugerencia seleccionada
+                if self.selected_key and self.selected_key[0] == -1 and self.selected_key[1] == i:
+                    color = (200, 255, 200)
+                else:
+                    color = (255, 255, 200)
+                
+                cv2.rectangle(img, (x, y), (x + 140, y + 30), color, -1)
+                cv2.rectangle(img, (x, y), (x + 140, y + 30), (0, 0, 0), 1)
+                
+                # Mostrar el prefijo en negro y el resto en azul
+                prefix_len = len(self.last_word_prefix)
+                cv2.putText(img, suggestion[:prefix_len], (x + 10, y + 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                text_size = cv2.getTextSize(suggestion[:prefix_len], cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                cv2.putText(img, suggestion[prefix_len:], (x + 10 + text_size[0], y + 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Dibujar teclas regulares
+        for i, row in enumerate(self.keyboard[:-1]):
+            for j, key in enumerate(row):
+                x = self.start_x + j * (self.key_size + self.key_margin)
+                y = self.start_y + i * (self.key_size + self.key_margin)
+                
+                # Resaltar tecla seleccionada
+                if self.selected_key == (i, j):
+                    color = (100, 255, 100)
+                elif key == 'MAYUS' and self.caps_lock:
+                    color = (100, 100, 255)
+                else:
+                    color = (230, 230, 230)
+                
+                cv2.rectangle(img, (x, y), (x + self.key_size, y + self.key_size), color, -1)
+                cv2.rectangle(img, (x, y), (x + self.key_size, y + self.key_size), (50, 50, 50), 2)
+                
+                # Mostrar texto de la tecla (en mayúsculas o minúsculas)
+                display_text = key if (self.caps_lock and key not in [',', '.', '¿']) else key.lower()
+                text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                text_x = x + (self.key_size - text_size[0]) // 2
+                text_y = y + (self.key_size + text_size[1]) // 2
+                cv2.putText(img, display_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        
+        # Dibujar teclas especiales
+        special_row = self.keyboard[-1]
+        total_special_width = sum(self.special_key_widths.values()) + (len(special_row)-1)*self.special_key_margin
+        start_x_special = self.start_x + (10*(self.key_size + self.key_margin) - total_special_width) // 2
+        
+        for j, key in enumerate(special_row):
+            x = start_x_special + sum([self.special_key_widths.get(k, 0) + self.special_key_margin for k in special_row[:j]])
+            y = self.start_y + 3 * (self.key_size + self.key_margin)
+            key_w = self.special_key_widths.get(key, self.key_size)
+            
+            # Resaltar tecla seleccionada
+            if self.selected_key == (3, j):
+                color = (100, 255, 100)
+            elif key == 'MAYUS' and self.caps_lock:
+                color = (100, 100, 255)
+            else:
+                color = (200, 200, 200)
+            
+            cv2.rectangle(img, (x, y), (x + key_w, y + self.key_size), color, -1)
+            cv2.rectangle(img, (x, y), (x + key_w, y + self.key_size), (50, 50, 50), 2)
+            
+            # Mostrar texto de tecla especial
+            display_text = key
+            font_scale = 0.6 if len(key) > 5 else 0.7
+            text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)[0]
+            text_x = x + (key_w - text_size[0]) // 2
+            text_y = y + (self.key_size + text_size[1]) // 2
+            cv2.putText(img, display_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 2)
+        
+        # Área de texto
+        text_area_w = (self.key_size + self.key_margin) * 10 - self.key_margin
+        cv2.rectangle(img, (self.start_x, self.start_y - 100), (self.start_x + text_area_w, self.start_y - 30), (255, 255, 255), -1)
+        cv2.rectangle(img, (self.start_x, self.start_y - 100), (self.start_x + text_area_w, self.start_y - 30), (0, 0, 0), 3)
+        
+        # Mostrar texto escrito con el prefijo actual resaltado
+        if self.last_word_prefix and ' ' in self.typed_text:
+            last_space_pos = self.typed_text.rfind(' ')
+            prefix_part = self.typed_text[:last_space_pos+1]
+            current_word_part = self.typed_text[last_space_pos+1:]
+            
+            # Dibujar la parte antes del prefijo
+            cv2.putText(img, prefix_part, (self.start_x + 15, self.start_y - 60), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+            
+            # Dibujar el prefijo actual en azul
+            prefix_size = cv2.getTextSize(prefix_part, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+            cv2.putText(img, current_word_part, (self.start_x + 15 + prefix_size[0], self.start_y - 60), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        else:
+            cv2.putText(img, self.typed_text, (self.start_x + 15, self.start_y - 60), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        
+        # Cursor parpadeante
+        if self.cursor_counter < 20:
+            cursor_x = self.start_x + 20 + cv2.getTextSize(self.typed_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0][0]
+            cv2.line(img, (cursor_x, self.start_y - 70), (cursor_x, self.start_y - 40), (0, 0, 0), 3)
+
+    def get_key_from_pos(self, x: int, y: int) -> Optional[Tuple[int, int, str]]:
+        """Obtiene la tecla en la posición (x, y)"""
+        # Verificar si se seleccionó una sugerencia
+        if self.suggestions and time.time() - self.last_typed_time < 3:
+            for i, suggestion in enumerate(self.suggestions[:3]):
+                sug_x = self.start_x + i * 150
+                sug_y = self.start_y - 120
+                if sug_x <= x <= sug_x + 140 and sug_y <= y <= sug_y + 30:
+                    return (-1, i, f"SUGGESTION_{suggestion}")  # Tecla especial para sugerencias
+        
+        # Verificar teclas regulares
+        for i, row in enumerate(self.keyboard[:-1]):
+            for j, key in enumerate(row):
+                key_x = self.start_x + j * (self.key_size + self.key_margin)
+                key_y = self.start_y + i * (self.key_size + self.key_margin)
+                
+                if key_x <= x <= key_x + self.key_size and key_y <= y <= key_y + self.key_size:
+                    return (i, j, key)
+        
+        # Verificar teclas especiales
+        special_row = self.keyboard[-1]
+        total_special_width = sum(self.special_key_widths.values()) + (len(special_row)-1)*self.special_key_margin
+        start_x_special = self.start_x + (10*(self.key_size + self.key_margin) - total_special_width) // 2
+        
+        for j, key in enumerate(special_row):
+            key_x = start_x_special + sum([self.special_key_widths.get(k, 0) + self.special_key_margin for k in special_row[:j]])
+            key_y = self.start_y + 3 * (self.key_size + self.key_margin)
+            key_w = self.special_key_widths.get(key, self.key_size)
+            
+            if key_x <= x <= key_x + key_w and key_y <= y <= key_y + self.key_size:
+                return (3, j, key)
+        
+        return None
+
+    def is_click(self, hand_landmarks) -> bool:
+        """Detecta gesto de clic"""
+        if self.click_cooldown > 0:
+            self.click_cooldown -= 1
+            return False
+            
+        thumb = hand_landmarks.landmark[4]
+        index = hand_landmarks.landmark[8]
+        distance = ((thumb.x - index.x)**2 + (thumb.y - index.y)**2)**0.5
+        
+        if distance < 0.05:
+            self.click_cooldown = 10
+            return True
+        return False
+
+    def process_key(self, key_info: Tuple[int, int, str]) -> None:
+        """Procesa la acción de una tecla o sugerencia"""
+        if not key_info:
+            return
+            
+        i, j, key = key_info
+        self.key_sound.play()
+        
+        # Manejar selección de sugerencia
+        if key.startswith("SUGGESTION_"):
+            suggested_word = key[11:]
+            # Reemplazar la última palabra parcial con la sugerencia
+            if ' ' in self.typed_text:
+                last_space_pos = self.typed_text.rfind(' ')
+                self.typed_text = self.typed_text[:last_space_pos+1] + suggested_word
+            else:
+                self.typed_text = suggested_word
+            self.suggestions = []
+            self.last_word_prefix = ""
+            return
+        
+        if key == 'BORRAR':
+            self.typed_text = self.typed_text[:-1]
+            self._update_suggestions()
+        elif key == 'ESPACIO':
+            self.typed_text += ' '
+            self.suggestions = []
+            self.last_word_prefix = ""
+        elif key == 'ENTER':
+            self.typed_text += '\n'
+            self.suggestions = []
+            self.last_word_prefix = ""
+        elif key == 'MAYUS':
+            self.caps_lock = not self.caps_lock
+        else:
+            self.typed_text += key if self.caps_lock else key.lower()
+            self._update_suggestions()
+    
+    def _update_suggestions(self):
+        """Actualiza las sugerencias basadas en el texto actual"""
+        self.last_typed_time = time.time()
+        
+        # Obtener la última palabra parcial
+        if ' ' in self.typed_text:
+            last_space_pos = self.typed_text.rfind(' ')
+            self.last_word_prefix = self.typed_text[last_space_pos+1:]
+        else:
+            self.last_word_prefix = self.typed_text
+        
+        if len(self.last_word_prefix) >= 1:  # Empezar a sugerir desde 1 carácter
+            self.suggestions = self.word_predictor.predict_completions(self.last_word_prefix)
+        else:
+            self.suggestions = []
+
+    def run(self):
+        """Ejecuta el bucle principal"""
+        try:
+            while self.cap.isOpened():
+                success, frame = self.cap.read()
+                if not success:
+                    continue
+                
+                frame = cv2.flip(frame, 1)
+                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image.flags.writeable = False
+                results = self.hands.process(image)
+                image.flags.writeable = True
+                
+                self.selected_key = None
+                
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                        
+                        index_tip = hand_landmarks.landmark[8]
+                        h, w, _ = frame.shape
+                        cursor_x, cursor_y = int(index_tip.x * w), int(index_tip.y * h)
+                        
+                        cv2.circle(frame, (cursor_x, cursor_y), 12, (0, 255, 255), -1)
+                        
+                        key_info = self.get_key_from_pos(cursor_x, cursor_y)
+                        if key_info:
+                            self.selected_key = (key_info[0], key_info[1])
+                            
+                            if self.is_click(hand_landmarks):
+                                self.process_key(key_info)
+                                cv2.circle(frame, (cursor_x, cursor_y), 20, (0, 0, 255), 3)
+                
+                self.draw_keyboard(frame)
+                
+                # Calcular posición Y para las instrucciones (debajo del teclado)
+                instruction_y = self.start_y + 4 * (self.key_size + self.key_margin) + 20
+                
+                # Mostrar instrucciones debajo del teclado
+                cv2.putText(frame, "Mueve el dedo indice para seleccionar letras", 
+                          (20, instruction_y), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame, "Junta pulgar e indice para hacer clic", 
+                          (20, instruction_y + 30), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Actualizar contador de cursor parpadeante
+                self.cursor_counter = (self.cursor_counter + 1) % 40
+                
+                # Mostrar frame
+                cv2.imshow('Teclado Virtual Inteligente', frame)
+                
+                # Salir con ESC
+                if cv2.waitKey(5) & 0xFF == 27:
+                    break
+                    
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        """Libera recursos"""
+        if hasattr(self, 'hands'):
+            self.hands.close()
+        if hasattr(self, 'cap') and self.cap.isOpened():
+            self.cap.release()
+        cv2.destroyAllWindows()
+        mixer.quit()
+        pygame.quit()
+
+if __name__ == "__main__":
+    keyboard = VirtualKeyboard()
+    keyboard.run()
